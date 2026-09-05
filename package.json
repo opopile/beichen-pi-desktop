@@ -31,7 +31,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.4",
-    "lucide-react": "^0.468.0",
+    "lucide-react": "^1.34.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-markdown": "^10.1.0",
