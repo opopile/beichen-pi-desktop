@@ -1,6 +1,6 @@
-# Beichen Pi 1.8.1 Complete User Guide
+# Beichen Pi 1.8.2 Complete User Guide
 
-> 中文版本：[北辰 Pi 1.8.1 完整使用说明](北辰Pi使用说明.md)
+> 中文版本：[北辰 Pi 1.8.2 完整使用说明](北辰Pi使用说明.md)
 >
 > Beichen Pi is an independent, unofficial open-source project. It is not affiliated with, sponsored by, or endorsed by any supported model provider.
 >
@@ -8,7 +8,7 @@
 
 > Supported platform: Windows 10/11 x64<br />
 > Current runtime: Electron 44 + Pi 0.84.4 RPC<br />
-> Document version: 1.8.1
+> Document version: 1.8.2
 
 ## 1. Product overview
 
@@ -33,8 +33,8 @@ Beichen Pi is designed primarily for locally deployed models such as Ollama, LM 
 
 Published builds are available from [GitHub Releases](https://github.com/opopile/beichen-pi-desktop/releases/latest):
 
-- `Beichen-Pi-Setup-1.8.1-x64.exe`: installer.
-- `Beichen-Pi-Portable-1.8.1-x64.exe`: portable executable with the same custom model/reasoning menus, context ring, context-mode slider, real-time provider-returned thinking, and Quantum/Ghost visualization.
+- `Beichen-Pi-Setup-1.8.2-x64.exe`: installer.
+- `Beichen-Pi-Portable-1.8.2-x64.exe`: portable executable with the same custom model/reasoning menus, context ring, context-mode slider, real-time provider-returned thinking, and Quantum/Ghost visualization.
 
 ### 2.1 Installer
 

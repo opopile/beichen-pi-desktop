@@ -1,6 +1,6 @@
-# 北辰 Pi 1.8.1 完整使用说明
+# 北辰 Pi 1.8.2 完整使用说明
 
-> English version: [Beichen Pi 1.8.1 Complete User Guide](USER_GUIDE_EN.md)
+> English version: [Beichen Pi 1.8.2 Complete User Guide](USER_GUIDE_EN.md)
 
 > 北辰 Pi 是独立、非官方的第三方开源项目，与所支持的模型服务商不存在隶属、合作或官方背书关系。
 >
@@ -8,7 +8,7 @@
 
 > 适用平台：Windows 10/11 x64
 > 当前内核：Electron 44 + Pi 0.84.4 RPC
-> 文档版本：1.8.1
+> 文档版本：1.8.2
 
 ## 1. 产品概览
 
@@ -31,8 +31,8 @@
 
 构建产物位于项目的 `release` 目录：
 
-- `Beichen-Pi-Setup-1.8.1-x64.exe`：安装版。
-- `Beichen-Pi-Portable-1.8.1-x64.exe`：模型和推理均使用应用自绘右侧子菜单的免安装便携版，同时保留独立圆环仪表、左上角上下文滑块、完整实时思考和大括号压缩/删除视图。
+- `Beichen-Pi-Setup-1.8.2-x64.exe`：安装版。
+- `Beichen-Pi-Portable-1.8.2-x64.exe`：模型和推理均使用应用自绘右侧子菜单的免安装便携版，同时保留独立圆环仪表、左上角上下文滑块、完整实时思考和大括号压缩/删除视图。
 
 ### 2.1 安装版
 
