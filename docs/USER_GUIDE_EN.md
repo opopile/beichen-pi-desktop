@@ -276,6 +276,8 @@ Changing Chat/Agent, changing a performance mode, triggering the exact-greeting 
 
 Open **Settings → Models & Access**, scroll to **Custom API**, and select **Add custom API**. Saving the endpoint applies it to the current window and adds it to the composer model list.
 
+The app ships **Quick setup** presets (for example Baimeow · Kimi K3 Max): selecting a preset fills in the endpoint and model automatically — paste your API key and choose **Save and apply**. Presets whose endpoint and model are already saved hide themselves.
+
 Basic fields:
 
 - **Connection name**: a local label such as “Office Gateway” or “Local Ollama”.

@@ -63,7 +63,7 @@ import { shouldUseLightRoute } from "./autoRouter";
 import { applyAssistantStreamEvent } from "./liveMessage";
 import { textFromContent } from "./messageUtils";
 import { buildConversationEntries, reasoningDispositionForMessage, thinkingBlocksFromContent } from "./reasoningView";
-import { accumulateReportedTokens, isNearScrollBottom, shouldResetBackendBeforeNewSession, shouldSubmitComposer, tokenSegmentWidth, workspaceLabel } from "./uiUtils";
+import { accumulateReportedTokens, CUSTOM_API_PRESETS, extensionDialogInitialValue, isNearScrollBottom, isSilentProfileActive, isTerminalBackendStatus, remainingCustomApiPresets, shouldResetBackendBeforeNewSession, shouldRestoreFullRouteBeforePrompt, shouldSubmitComposer, surfaceSwitchRestartPatch, tokenSegmentWidth, workspaceLabel, type CustomApiPreset } from "./uiUtils";
 import type {
   AgentMessage,
   Attachment,
@@ -89,6 +89,7 @@ import type {
 } from "./types";
 
 const THINKING_ORDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const MAX_ATTACHMENTS = 4;
 
 const PROFILE_ICONS: Record<ProfileId, typeof BrainCircuit> = {
   codex: BrainCircuit,
@@ -129,6 +130,8 @@ const UI = {
     ask: "询问北辰 Pi",
     workIn: "中工作",
     attach: "添加图片",
+    attachmentLimit: "最多可添加 4 张图片；超出的图片未添加。",
+    attachmentReadError: "部分图片读取失败，未能添加。",
     voice: "语音输入（即将推出）",
     stop: "停止",
     contextReady: "上下文就绪",
@@ -200,6 +203,8 @@ const UI = {
     keylessApi: "无密钥本地服务",
     customApiSaved: "自定义 API 已保存并应用",
     customApiDeleted: "自定义 API 已删除",
+    customApiPreset: "快速接入",
+    customApiPresetHint: "预设已填好地址与模型，填入 API Key 保存即可使用。",
     advancedCompatibility: "模型能力与兼容性",
     subscription: "会员订阅",
     provider: "服务商",
@@ -296,6 +301,8 @@ const UI = {
     ask: "Ask Beichen Pi",
     workIn: "Work in",
     attach: "Attach image",
+    attachmentLimit: "You can attach up to 4 images; extra images were not added.",
+    attachmentReadError: "Some images could not be read and were not added.",
     voice: "Voice input (coming soon)",
     stop: "Stop",
     contextReady: "Context ready",
@@ -367,6 +374,8 @@ const UI = {
     keylessApi: "Keyless local server",
     customApiSaved: "Custom API saved and applied",
     customApiDeleted: "Custom API deleted",
+    customApiPreset: "Quick setup",
+    customApiPresetHint: "The preset fills in the endpoint and model — just add your API key and save.",
     advancedCompatibility: "Model capabilities & compatibility",
     subscription: "Subscription",
     provider: "Provider",
@@ -1465,10 +1474,23 @@ function ExtensionModal({
   t,
 }: {
   dialog: ExtensionDialog;
-  onRespond: (response: Record<string, unknown>) => void;
+  onRespond: (response: Record<string, unknown>) => Promise<void>;
   t: Translate;
 }) {
-  const [value, setValue] = useState(String(dialog.value || ""));
+  const [value, setValue] = useState(extensionDialogInitialValue(dialog));
+  const [responding, setResponding] = useState(false);
+  const respondingRef = useRef(false);
+  const respond = async (response: Record<string, unknown>) => {
+    if (respondingRef.current) return;
+    respondingRef.current = true;
+    setResponding(true);
+    try {
+      await onRespond(response);
+    } finally {
+      respondingRef.current = false;
+      setResponding(false);
+    }
+  };
   return (
     <div className="modal-backdrop">
       <div className="modal-card extension-modal">
@@ -1478,24 +1500,24 @@ function ExtensionModal({
         {dialog.method === "select" ? (
           <div className="auth-options">
             {dialog.options?.map((option) => (
-              <button key={option} onClick={() => onRespond({ value: option })}>{option}</button>
+              <button disabled={responding} key={option} onClick={() => void respond({ value: option })}>{option}</button>
             ))}
           </div>
         ) : dialog.method === "input" || dialog.method === "editor" ? (
           <textarea
             autoFocus
+            disabled={responding}
             value={value}
             placeholder={dialog.placeholder}
             onChange={(event) => setValue(event.target.value)}
           />
         ) : null}
         <div className="modal-actions">
-          <button onClick={() => onRespond({ cancelled: true })}>{t("cancel")}</button>
+          <button disabled={responding} onClick={() => void respond({ cancelled: true })}>{t("cancel")}</button>
           <button
             className="primary-button"
-            onClick={() =>
-              onRespond(dialog.method === "confirm" ? { confirmed: true } : { value })
-            }
+            disabled={responding}
+            onClick={() => void respond(dialog.method === "confirm" ? { confirmed: true } : { value })}
           >
             {t("confirm")}
           </button>
@@ -1568,9 +1590,25 @@ function CustomApiManager({
   const [formOpen, setFormOpen] = useState(initiallyOpen);
   const [form, setForm] = useState<CustomApiInput>(DEFAULT_CUSTOM_API);
   const [saving, setSaving] = useState(false);
+  const [activePreset, setActivePreset] = useState<CustomApiPreset | null>(null);
+  const pendingPresets = remainingCustomApiPresets(CUSTOM_API_PRESETS, entries);
 
   const beginNew = () => {
     setForm({ ...DEFAULT_CUSTOM_API });
+    setActivePreset(null);
+    setFormOpen(true);
+  };
+
+  const beginPreset = (preset: CustomApiPreset) => {
+    setForm({
+      ...DEFAULT_CUSTOM_API,
+      name: preset.name,
+      api: preset.api,
+      baseUrl: preset.baseUrl,
+      modelId: preset.modelId,
+      modelName: preset.modelName,
+    });
+    setActivePreset(preset);
     setFormOpen(true);
   };
 
@@ -1593,6 +1631,7 @@ function CustomApiManager({
       authHeader: entry.authHeader,
       useApiKey: entry.useApiKey,
     });
+    setActivePreset(null);
     setFormOpen(true);
   };
 
@@ -1604,6 +1643,7 @@ function CustomApiManager({
       if (await onSave(form)) {
         setFormOpen(false);
         setForm({ ...DEFAULT_CUSTOM_API });
+        setActivePreset(null);
       }
     } finally {
       setSaving(false);
@@ -1620,6 +1660,17 @@ function CustomApiManager({
         </div>
         <button type="button" className="outline-button" onClick={beginNew}><Plus size={14} />{t("addCustomApi")}</button>
       </div>
+
+      {pendingPresets.length ? (
+        <div className="custom-api-presets">
+          <span className="field-label">{t("customApiPreset")}</span>
+          {pendingPresets.map((preset) => (
+            <button key={preset.presetId} type="button" className="outline-button custom-api-preset" title={preset.baseUrl} onClick={() => beginPreset(preset)}>
+              <Zap size={13} />{preset.name} · {preset.modelName}
+            </button>
+          ))}
+        </div>
+      ) : null}
 
       {entries.length ? (
         <div className="custom-api-list">
@@ -1656,6 +1707,7 @@ function CustomApiManager({
             <strong>{form.providerId ? t("editCustomApi") : t("addCustomApi")}</strong>
             <button type="button" onClick={() => setFormOpen(false)}><X size={14} /></button>
           </div>
+          {activePreset ? <p className="custom-form-preset-hint">{t("customApiPresetHint")}</p> : null}
           <div className="custom-form-grid">
             <label><span>{t("customApiName")}</span><input required maxLength={80} value={form.name} onChange={(event) => setForm((value) => ({ ...value, name: event.target.value }))} placeholder="My API" /></label>
             <label><span>{t("apiProtocol")}</span><select value={form.api} onChange={(event) => setForm((value) => ({ ...value, api: event.target.value as CustomApiInput["api"] }))}>
@@ -2055,6 +2107,7 @@ export default function App() {
   const [routeRestoring, setRouteRestoring] = useState(false);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [pendingAttachmentCount, setPendingAttachmentCount] = useState(0);
   const [backendStatus, setBackendStatus] = useState<{ state: string; message?: string }>({ state: "starting", message: "正在启动" });
   const [toast, setToast] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -2080,10 +2133,17 @@ export default function App() {
   const configRef = useRef<WindowConfig | null>(null);
   const settleRef = useRef<() => void>(() => undefined);
   const restoreFullAfterLightRef = useRef(false);
-  const restoreRouteRef = useRef<() => Promise<void>>(async () => undefined);
+  const restoreRouteRef = useRef<() => Promise<boolean>>(async () => false);
+  const routeRestorePromiseRef = useRef<Promise<boolean> | null>(null);
+  const attachmentsRef = useRef<Attachment[]>([]);
+  const pendingAttachmentCountRef = useRef(0);
   const runMetricsRef = useRef({ startedAt: 0, estimatedTokens: 0, actualTokens: 0 });
 
   const command = useCallback(<T,>(payload: Record<string, unknown>) => window.beichen.command(payload) as Promise<T>, []);
+  const replaceAttachments = useCallback((next: Attachment[]) => {
+    attachmentsRef.current = next;
+    setAttachments(next);
+  }, []);
   const t = useCallback<Translate>((key) => UI[locale][key], [locale]);
 
   useEffect(() => {
@@ -2300,7 +2360,20 @@ export default function App() {
           break;
       }
     });
-    const offStatus = window.beichen.onBackendStatus((status) => setBackendStatus(status));
+    const offStatus = window.beichen.onBackendStatus((status) => {
+      setBackendStatus(status);
+      if (!isTerminalBackendStatus(status.state)) return;
+
+      setIsStreaming(false);
+      setIsCompacting(false);
+      setLiveMessage(null);
+      setExtensionDialog(null);
+      setToolRuns((runs) => runs.map((run) => run.status === "running"
+        ? { ...run, status: "error", result: status.message || "Pi 引擎意外停止" }
+        : run));
+      if (configRef.current?.routeTier !== "full") restoreFullAfterLightRef.current = true;
+      if (restoreFullAfterLightRef.current) void restoreRouteRef.current();
+    });
     const offAuthPrompt = window.beichen.onAuthPrompt((request) => setAuthPrompt(request));
     const offAuthEvent = window.beichen.onAuthEvent((payload) => {
       const event = (payload as any).event;
@@ -2410,8 +2483,11 @@ export default function App() {
     options: { background?: boolean } = {},
   ) => {
     if (!options.background) setSwitching(true);
+    setIsStreaming(false);
+    setIsCompacting(false);
     setLiveMessage(null);
     setToolRuns([]);
+    setExtensionDialog(null);
     try {
       const next = await window.beichen.restartBackend(patch);
       configRef.current = next;
@@ -2427,15 +2503,23 @@ export default function App() {
   }, [loadEngineState]);
 
   useEffect(() => {
-    restoreRouteRef.current = async () => {
-      if (!restoreFullAfterLightRef.current) return;
+    restoreRouteRef.current = () => {
+      if (routeRestorePromiseRef.current) return routeRestorePromiseRef.current;
+      if (!restoreFullAfterLightRef.current && configRef.current?.routeTier === "full") return Promise.resolve(true);
+
       restoreFullAfterLightRef.current = false;
       setRouteRestoring(true);
-      try {
-        await restartWith({ routeTier: "full" }, { background: true });
-      } finally {
+      const restorePromise = (async () => {
+        const restored = await restartWith({ routeTier: "full" }, { background: true });
+        const fullRouteActive = restored && configRef.current?.routeTier === "full";
+        restoreFullAfterLightRef.current = !fullRouteActive;
+        return fullRouteActive;
+      })().finally(() => {
+        routeRestorePromiseRef.current = null;
         setRouteRestoring(false);
-      }
+      });
+      routeRestorePromiseRef.current = restorePromise;
+      return restorePromise;
     };
   }, [restartWith]);
 
@@ -2454,13 +2538,25 @@ export default function App() {
   }, [restartWith]);
 
   const switchSurface = useCallback((surface: SurfaceMode) => {
-    if (configRef.current?.surface === surface) return;
-    void restartWith({ surface, profile: surface === "codex" ? configRef.current?.profile || "codex" : "codex", routeTier: "full" });
-  }, [restartWith]);
+    if (switching || isStreaming || routeRestoring || configRef.current?.surface === surface) return;
+    void restartWith(surfaceSwitchRestartPatch(surface));
+  }, [isStreaming, restartWith, routeRestoring, switching]);
 
   const sendPrompt = useCallback(async () => {
     const message = input.trim();
-    if ((!message && attachments.length === 0) || switching || routeRestoring) return;
+    if (
+      (!message && attachments.length === 0) ||
+      pendingAttachmentCount > 0 ||
+      switching ||
+      routeRestoring ||
+      (isStreaming && restoreFullAfterLightRef.current)
+    ) return;
+    if (shouldRestoreFullRouteBeforePrompt({
+      routeTier: configRef.current?.routeTier,
+      restorePending: restoreFullAfterLightRef.current,
+      isStreaming,
+    }) && !await restoreRouteRef.current()) return;
+
     const outgoingAttachments = attachments;
     const useLightRoute = shouldUseLightRoute({
       surface: configRef.current?.surface || "codex",
@@ -2478,6 +2574,10 @@ export default function App() {
         { background: false },
       );
       restoreFullAfterLightRef.current = lightRouteActive;
+      if (!lightRouteActive) {
+        restoreFullAfterLightRef.current = true;
+        if (!await restoreRouteRef.current()) return;
+      }
     }
 
     const localMessage: AgentMessage = {
@@ -2489,7 +2589,7 @@ export default function App() {
     autoScrollRef.current = true;
     setMessages((current) => [...current, localMessage]);
     setInput("");
-    setAttachments([]);
+    replaceAttachments([]);
 
     try {
       await command({
@@ -2508,12 +2608,9 @@ export default function App() {
       });
     } catch (error) {
       setToast(error instanceof Error ? error.message : "消息发送失败");
-      if (lightRouteActive) {
-        restoreFullAfterLightRef.current = false;
-        await restartWith({ routeTier: "full" }, { background: true });
-      }
+      if (lightRouteActive) await restoreRouteRef.current();
     }
-  }, [attachments, command, input, isStreaming, messages.length, restartWith, routeRestoring, switching]);
+  }, [attachments, command, input, isStreaming, messages.length, pendingAttachmentCount, replaceAttachments, restartWith, routeRestoring, switching]);
 
   const onComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (shouldSubmitComposer({
@@ -2529,23 +2626,40 @@ export default function App() {
 
   const addAttachments = async (files: File[] | null) => {
     if (!files) return;
+    const imageFiles = files.filter((file) => file.type.startsWith("image/"));
+    const remainingSlots = Math.max(0, MAX_ATTACHMENTS - attachmentsRef.current.length - pendingAttachmentCountRef.current);
+    if (imageFiles.length > remainingSlots) setToast(t("attachmentLimit"));
+
+    const selectedFiles = imageFiles.slice(0, remainingSlots);
+    pendingAttachmentCountRef.current += selectedFiles.length;
+    setPendingAttachmentCount(pendingAttachmentCountRef.current);
     const next: Attachment[] = [];
-    for (const file of files.slice(0, 4)) {
-      if (!file.type.startsWith("image/")) continue;
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
-        reader.onerror = () => reject(reader.error);
-        reader.readAsDataURL(file);
-      });
-      next.push({
-        name: file.name,
-        mimeType: file.type,
-        data: dataUrl.split(",")[1] || "",
-        previewUrl: dataUrl,
-      });
+    let readFailed = false;
+    try {
+      for (const file of selectedFiles) {
+        try {
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = () => reject(reader.error || new Error("Image read failed"));
+            reader.readAsDataURL(file);
+          });
+          next.push({
+            name: file.name,
+            mimeType: file.type,
+            data: dataUrl.split(",")[1] || "",
+            previewUrl: dataUrl,
+          });
+        } catch {
+          readFailed = true;
+        }
+      }
+    } finally {
+      pendingAttachmentCountRef.current = Math.max(0, pendingAttachmentCountRef.current - selectedFiles.length);
+      setPendingAttachmentCount(pendingAttachmentCountRef.current);
     }
-    setAttachments((current) => [...current, ...next].slice(0, 4));
+    if (readFailed) setToast(t("attachmentReadError"));
+    if (next.length) replaceAttachments([...attachmentsRef.current, ...next].slice(0, MAX_ATTACHMENTS));
   };
 
   const newSession = async () => {
@@ -2745,9 +2859,10 @@ export default function App() {
     setTheme(order[(order.indexOf(theme) + 1) % order.length]);
   };
 
-  const conversationEntries = buildConversationEntries(messages, Boolean(activeProfile?.silent), isStreaming);
+  const silentProfileActive = isSilentProfileActive(config?.surface || "codex", Boolean(activeProfile?.silent));
+  const conversationEntries = buildConversationEntries(messages, silentProfileActive, isStreaming);
   const liveHasThinking = Boolean(liveMessage && thinkingFromContent(liveMessage.content));
-  const showLive = Boolean(liveMessage && (!activeProfile?.silent || liveHasThinking));
+  const showLive = Boolean(liveMessage && (!silentProfileActive || liveHasThinking));
   const contextProfile = config?.surface === "codex" ? config.profile : undefined;
   const empty = conversationEntries.length === 0 && !showLive;
 
@@ -2842,8 +2957,8 @@ export default function App() {
             <div className="toolbar-left">
               {sidebarCollapsed ? <button className="icon-button" onClick={() => setSidebarCollapsed(false)}><PanelLeft size={18} /></button> : null}
               <div className="surface-switch">
-                <button className={config.surface === "chatgpt" ? "active" : ""} onClick={() => switchSurface("chatgpt")}>ChatGPT</button>
-                <button className={config.surface === "codex" ? "active" : ""} onClick={() => switchSurface("codex")}>Codex</button>
+                <button disabled={switching || isStreaming || routeRestoring} className={config.surface === "chatgpt" ? "active" : ""} onClick={() => switchSurface("chatgpt")}>ChatGPT</button>
+                <button disabled={switching || isStreaming || routeRestoring} className={config.surface === "codex" ? "active" : ""} onClick={() => switchSurface("codex")}>Codex</button>
               </div>
               {config.surface === "codex" ? (
                 <div className="mode-host">
@@ -2921,11 +3036,11 @@ export default function App() {
                   locale={locale}
                   live
                   profile={contextProfile}
-                  thinkingOnly={Boolean(activeProfile?.silent)}
+                  thinkingOnly={silentProfileActive}
                 />
               ) : null}
-              {!activeProfile?.silent ? <ToolTimeline runs={toolRuns} locale={locale} /> : null}
-              {isStreaming && activeProfile?.silent ? (
+              {!silentProfileActive ? <ToolTimeline runs={toolRuns} locale={locale} /> : null}
+              {isStreaming && silentProfileActive ? (
                 <div className={`silent-run silent-${config.profile}`} aria-label={t("silentWorking")}>
                   <span className="silent-orbit"><i /><i /><i /></span>
                 </div>
@@ -2940,7 +3055,7 @@ export default function App() {
                   {attachments.map((attachment, index) => (
                     <div className="attachment-preview" key={`${attachment.name}-${index}`}>
                       <img src={attachment.previewUrl} alt={attachment.name} />
-                      <button onClick={() => setAttachments((items) => items.filter((_, itemIndex) => itemIndex !== index))}><X size={12} /></button>
+                      <button onClick={() => replaceAttachments(attachmentsRef.current.filter((_, itemIndex) => itemIndex !== index))}><X size={12} /></button>
                     </div>
                   ))}
                 </div>
@@ -2988,7 +3103,7 @@ export default function App() {
                 {isStreaming ? (
                   <button className="send-button stop" title={t("stop")} onClick={() => void command({ type: "abort" })}><CircleStop size={19} /></button>
                 ) : (
-                  <button className="send-button" disabled={(!input.trim() && !attachments.length) || switching || routeRestoring} onClick={() => void sendPrompt()}><ArrowUp size={19} /></button>
+                  <button className="send-button" disabled={(!input.trim() && !attachments.length) || pendingAttachmentCount > 0 || switching || routeRestoring} onClick={() => void sendPrompt()}><ArrowUp size={19} /></button>
                 )}
               </div>
             </div>
@@ -3078,11 +3193,17 @@ export default function App() {
 
       {extensionDialog ? (
         <ExtensionModal
+          key={extensionDialog.id}
           dialog={extensionDialog}
           t={t}
-          onRespond={(response) => {
-            void window.beichen.raw({ type: "extension_ui_response", id: extensionDialog.id, ...response });
-            setExtensionDialog(null);
+          onRespond={async (response) => {
+            const dialogId = extensionDialog.id;
+            try {
+              await window.beichen.raw({ type: "extension_ui_response", id: dialogId, ...response });
+              setExtensionDialog((current) => current?.id === dialogId ? null : current);
+            } catch (error) {
+              setToast(error instanceof Error ? error.message : "插件响应失败");
+            }
           }}
         />
       ) : null}

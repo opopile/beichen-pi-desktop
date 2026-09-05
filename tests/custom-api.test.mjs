@@ -70,3 +70,26 @@ test("keyless local APIs remain configurable without embedding a credential", ()
   const provider = buildProviderConfig(entry);
   assert.match(provider.apiKey, /^\$BEICHEN_CUSTOM_API_/);
 });
+
+test("bundled presets pass backend normalization exactly as the form would submit them", async () => {
+  const { CUSTOM_API_PRESETS } = await import("../src/uiUtils.ts");
+  assert.ok(CUSTOM_API_PRESETS.length >= 1);
+  for (const preset of CUSTOM_API_PRESETS) {
+    const entry = normalizeCustomApiInput(
+      { ...preset, apiKey: "" },
+      { providerId: "beichen-custom-preset01" },
+    );
+    assert.equal(entry.baseUrl, preset.baseUrl.replace(/\/+$/, ""));
+    assert.equal(entry.api, preset.api);
+    assert.equal(entry.modelId, preset.modelId);
+    assert.equal(entry.modelName, preset.modelName);
+    assert.equal(entry.useApiKey, true);
+    const provider = buildProviderConfig(entry);
+    assert.equal(provider.baseUrl, preset.baseUrl.replace(/\/+$/, ""));
+    assert.equal(provider.models[0].id, preset.modelId);
+    assert.match(provider.apiKey, /^\$BEICHEN_CUSTOM_API_/);
+  }
+  const baimeow = CUSTOM_API_PRESETS.find((preset) => preset.baseUrl === "https://api.baimeow.icu/v1");
+  assert.ok(baimeow, "baimeow endpoint preset is bundled");
+  assert.equal(baimeow.modelId, "kimi-k3-max");
+});

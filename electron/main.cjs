@@ -36,7 +36,9 @@ const ICON_PATH = path.join(ROOT_DIR, "output", "北辰标志_极简漩涡聚焦
 const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
 const windows = new Map();
 const pendingAuthPrompts = new Map();
+const pendingBackendStops = new Set();
 let modelRuntimePromise;
+let appShutdownStarted = false;
 const activeCustomApiEnvNames = new Set();
 const SECURITY_NOTICE_VERSION = 1;
 
@@ -59,6 +61,27 @@ function rejectAuthPromptsForSender(senderId, reason = "窗口已关闭") {
     pendingAuthPrompts.delete(id);
     pending.reject(new Error(reason));
   }
+}
+
+function trackBackendStop(record) {
+  const pending = Promise.resolve().then(async () => {
+    const restart = record.backendRestartPromise;
+    if (record.backend) await record.backend.stop();
+    if (restart) {
+      try {
+        await restart;
+      } catch {
+        // A failed restart still leaves the record ready for authoritative stop.
+      }
+    }
+    if (record.backend) await record.backend.stop();
+  });
+  pendingBackendStops.add(pending);
+  pending.then(
+    () => pendingBackendStops.delete(pending),
+    () => pendingBackendStops.delete(pending),
+  );
+  return pending;
 }
 
 function unpackedPath(inputPath) {
@@ -224,6 +247,7 @@ class PiBackend {
     this.pending = new Map();
     this.sequence = 0;
     this.readySignalSent = false;
+    this.stopPromise = null;
   }
 
   emit(channel, payload) {
@@ -258,6 +282,13 @@ class PiBackend {
 
   start() {
     if (this.child) return;
+    if (this.stopPromise) throw new Error("Pi 引擎正在停止");
+
+    // A PiBackend instance can be reused after an unexpected process exit.  All
+    // process-scoped state must therefore be reset before every spawn.
+    this.readySignalSent = false;
+    this.stdoutBuffer = "";
+    this.stderrTail = [];
     applyCustomApiEnvironment();
     const cliPath = resolvePiCli();
     const profile = getProfile(this.config.profile);
@@ -269,18 +300,31 @@ class PiBackend {
     if (!app.isPackaged) env.ELECTRON_RUN_AS_NODE = "1";
 
     this.emit("backend:status", { state: "starting", message: "正在启动 Pi 引擎" });
-    this.child = spawn(resolveNodeRuntime(), [cliPath, ...this.buildArgs()], {
-      cwd: this.config.cwd,
-      env,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
+    let child;
+    try {
+      child = spawn(resolveNodeRuntime(), [cliPath, ...this.buildArgs()], {
+        cwd: this.config.cwd,
+        env,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      this.emit("backend:status", {
+        state: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+    this.child = child;
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
+    child.stdout.on("data", (chunk) => {
+      if (this.child === child) this.consumeStdout(chunk);
     });
-
-    this.child.stdout.setEncoding("utf8");
-    this.child.stderr.setEncoding("utf8");
-
-    this.child.stdout.on("data", (chunk) => this.consumeStdout(chunk));
-    this.child.stderr.on("data", (chunk) => {
+    child.stderr.on("data", (chunk) => {
+      if (this.child !== child) return;
       const lines = String(chunk)
         .split(/\r?\n/)
         .map((line) => line.trim())
@@ -289,17 +333,36 @@ class PiBackend {
       this.stderrTail = this.stderrTail.slice(-24);
     });
 
-    this.child.on("error", (error) => {
+    let finalized = false;
+    const handleProcessError = (error) => {
+      if (finalized || this.child !== child) return;
+      finalized = true;
+      this.child = null;
       this.emit("backend:status", { state: "error", message: error.message });
       this.rejectPending(error);
-    });
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // The process may have already exited after closing its input pipe.
+        }
+      }
+    };
 
-    this.child.on("exit", (code, signal) => {
-      const expected = this.child === null;
+    // Without an error listener, an EPIPE from a crashed child can terminate the
+    // Electron main process before the child-process exit event is delivered.
+    child.stdin.on("error", handleProcessError);
+    child.once("error", handleProcessError);
+
+    child.once("exit", (code, signal) => {
+      if (finalized) return;
+      finalized = true;
+      const active = this.child === child;
       const details = this.stderrTail.at(-1) || `Pi 已退出（${code ?? signal ?? "unknown"}）`;
-      if (!expected) this.emit("backend:status", { state: "stopped", message: details });
-      this.rejectPending(new Error(details));
+      if (!active) return;
       this.child = null;
+      this.emit("backend:status", { state: "stopped", message: details });
+      this.rejectPending(new Error(details));
     });
   }
 
@@ -339,6 +402,7 @@ class PiBackend {
 
   command(payload, timeoutMs) {
     this.start();
+    const child = this.child;
     const id = payload.id || `desktop-${Date.now()}-${++this.sequence}`;
     const command = { ...payload, id };
     const effectiveTimeout =
@@ -352,7 +416,12 @@ class PiBackend {
       this.pending.set(id, { resolve, reject, timer });
 
       try {
-        this.child.stdin.write(`${JSON.stringify(command)}\n`);
+        child.stdin.write(`${JSON.stringify(command)}\n`, (error) => {
+          if (!error || !this.pending.has(id)) return;
+          clearTimeout(timer);
+          this.pending.delete(id);
+          reject(error);
+        });
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
@@ -363,7 +432,17 @@ class PiBackend {
 
   raw(payload) {
     this.start();
-    this.child.stdin.write(`${JSON.stringify(payload)}\n`);
+    const child = this.child;
+    return new Promise((resolve, reject) => {
+      try {
+        child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
   }
 
   rejectPending(error) {
@@ -375,32 +454,56 @@ class PiBackend {
   }
 
   async stop() {
+    if (this.stopPromise) return this.stopPromise;
     if (!this.child) return;
     const child = this.child;
     this.child = null;
     this.rejectPending(new Error("Pi 引擎正在重启"));
 
-    try {
-      child.stdin.end();
-    } catch {
-      // Process already closed.
-    }
+    const stopPromise = new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        resolve();
+        return;
+      }
 
-    await new Promise((resolve) => {
-      if (child.exitCode !== null) return resolve();
-      const timer = setTimeout(() => {
+      let timer;
+      const finish = () => {
+        clearTimeout(timer);
+        child.removeListener("exit", finish);
+        child.removeListener("close", finish);
+        resolve();
+      };
+      child.once("exit", finish);
+      // A process that failed to spawn emits "error" and then "close", but no
+      // "exit". Listening for both covers that terminal state without resolving
+      // merely because kill() was requested.
+      child.once("close", finish);
+
+      timer = setTimeout(() => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          finish();
+          return;
+        }
         try {
-          child.kill();
+          child.kill("SIGKILL");
         } catch {
           // Process already closed.
         }
-        resolve();
       }, 1500);
-      child.once("exit", () => {
-        clearTimeout(timer);
-        resolve();
-      });
+
+      try {
+        child.stdin.end();
+      } catch {
+        // Process already closed.
+      }
     });
+
+    this.stopPromise = stopPromise;
+    try {
+      await stopPromise;
+    } finally {
+      if (this.stopPromise === stopPromise) this.stopPromise = null;
+    }
   }
 }
 
@@ -408,8 +511,18 @@ function createInitialConfig(overrides = {}) {
   const appSettings = readJson(appSettingsPath(), {});
   const piDefaults = getPiDefaults();
   const stored = appSettings.defaults || {};
-  const requestedCwd = overrides.cwd || stored.cwd || process.cwd();
-  const cwd = fs.existsSync(requestedCwd) ? requestedCwd : app.getPath("documents");
+  // createInitialConfig is only called from createWindow after app.whenReady(),
+  // so Electron's platform-aware Documents path is available here.
+  const documentsCwd = app.getPath("documents");
+  const requestedCwd = overrides.cwd || stored.cwd || documentsCwd;
+  let cwd = documentsCwd;
+  if (typeof requestedCwd === "string" && requestedCwd.trim()) {
+    try {
+      if (fs.statSync(requestedCwd).isDirectory()) cwd = requestedCwd;
+    } catch {
+      // Missing or inaccessible saved workspaces fall back to Documents.
+    }
+  }
   const profile = visibleProfileId(overrides.profile || stored.profile || "codex");
 
   return {
@@ -445,7 +558,7 @@ function createWindow(overrides = {}) {
   });
 
   const webContentsId = win.webContents.id;
-  const record = { window: win, config, backend: null };
+  const record = { window: win, config, backend: null, backendRestartPromise: null, closed: false };
   windows.set(webContentsId, record);
 
   const allowedRendererPermissions = new Set(["clipboard-sanitized-write"]);
@@ -469,7 +582,8 @@ function createWindow(overrides = {}) {
   win.on("closed", () => {
     rejectAuthPromptsForSender(webContentsId);
     const current = windows.get(webContentsId);
-    if (current?.backend) current.backend.stop();
+    if (current) current.closed = true;
+    if (current?.backend || current?.backendRestartPromise) void trackBackendStop(current);
     windows.delete(webContentsId);
   });
 
@@ -1222,14 +1336,17 @@ function recordForEvent(event) {
 }
 
 function ensureBackend(record) {
+  if (record.closed || record.window?.isDestroyed?.()) throw new Error("窗口已关闭");
+  if (appShutdownStarted) throw new Error("应用正在退出");
   if (!record.backend) {
-    record.backend = new PiBackend(record.window, record.config);
-    record.backend.start();
+    const backend = new PiBackend(record.window, record.config);
+    backend.start();
+    record.backend = backend;
   }
   return record.backend;
 }
 
-async function restartBackend(record, patch) {
+async function performBackendRestart(record, patch) {
   patch = {
     ...patch,
     ...(patch.profile ? { profile: visibleProfileId(patch.profile) } : {}),
@@ -1248,7 +1365,9 @@ async function restartBackend(record, patch) {
   }
 
   if (record.backend) await record.backend.stop();
-  record.config = {
+  if (record.closed || record.window?.isDestroyed?.()) throw new Error("窗口已关闭");
+  if (appShutdownStarted) throw new Error("应用正在退出");
+  const nextConfig = {
     ...record.config,
     ...patch,
     thinkingLevel,
@@ -1256,8 +1375,10 @@ async function restartBackend(record, patch) {
       ? undefined
       : Object.prototype.hasOwnProperty.call(patch, "sessionPath") ? patch.sessionPath : sessionPath,
   };
-  record.backend = new PiBackend(record.window, record.config);
-  record.backend.start();
+  const nextBackend = new PiBackend(record.window, nextConfig);
+  nextBackend.start();
+  record.config = nextConfig;
+  record.backend = nextBackend;
 
   writeAppSettings((current) => ({
     ...current,
@@ -1273,6 +1394,22 @@ async function restartBackend(record, patch) {
   }));
 
   return { ...record.config, sessionPath: undefined };
+}
+
+function restartBackend(record, patch) {
+  const requestedPatch = patch && typeof patch === "object" && !Array.isArray(patch) ? { ...patch } : {};
+  const previous = record.backendRestartPromise || Promise.resolve();
+  const operation = previous
+    .catch(() => undefined)
+    .then(() => {
+      if (record.closed || record.window?.isDestroyed?.()) throw new Error("窗口已关闭");
+      if (appShutdownStarted) throw new Error("应用正在退出");
+      return performBackendRestart(record, requestedPatch);
+    });
+  record.backendRestartPromise = operation;
+  return operation.finally(() => {
+    if (record.backendRestartPromise === operation) record.backendRestartPromise = null;
+  });
 }
 
 function persistRuntimeSelection(record) {
@@ -1324,6 +1461,7 @@ async function restartWindowsForRegistryChange(targetRecord, patchForRecord) {
     return 0;
   });
   for (const currentRecord of ordered) {
+    if (currentRecord.closed || currentRecord.window?.isDestroyed?.()) continue;
     await restartBackend(currentRecord, patchForRecord(currentRecord));
   }
 }
@@ -1618,7 +1756,7 @@ ipcMain.handle("pi:command", async (event, payload) => {
 
 ipcMain.handle("pi:raw", async (event, payload) => {
   const record = recordForEvent(event);
-  ensureBackend(record).raw(payload);
+  await ensureBackend(record).raw(payload);
   return true;
 });
 
@@ -1634,6 +1772,9 @@ ipcMain.handle("custom-api:delete", (event, providerId) => deleteCustomApi(recor
 
 ipcMain.handle("sessions:list", () => listSessions());
 ipcMain.handle("sessions:switch", async (event, sessionPath) => {
+  if (typeof sessionPath !== "string" || !sessionPath.trim()) {
+    throw new Error("会话路径无效");
+  }
   const record = recordForEvent(event);
   const data = await ensureBackend(record).command({ type: "switch_session", sessionPath });
   if (!data?.cancelled) record.config.sessionPath = sessionPath;
@@ -1753,8 +1894,21 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", () => {
+let backendShutdownPromise = null;
+let allowQuitAfterBackendStop = false;
+app.on("before-quit", (event) => {
+  if (allowQuitAfterBackendStop) return;
+  event.preventDefault();
+  if (backendShutdownPromise) return;
+  appShutdownStarted = true;
+
+  const stops = [...pendingBackendStops];
   for (const record of windows.values()) {
-    if (record.backend) record.backend.stop();
+    if (record.backend || record.backendRestartPromise) stops.push(trackBackendStop(record));
   }
+
+  backendShutdownPromise = Promise.allSettled(stops).then(() => {
+    allowQuitAfterBackendStop = true;
+    app.quit();
+  });
 });

@@ -203,5 +203,6 @@ export interface ExtensionDialog {
   options?: string[];
   placeholder?: string;
   value?: string;
+  prefill?: string;
   [key: string]: unknown;
 }

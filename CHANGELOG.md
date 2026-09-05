@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.8.2 — 2026-08-30
+
+- Added one-click custom API presets under Settings → Custom API (bundled: Baimeow relay serving `kimi-k3-max` via OpenAI Chat Completions at `https://api.baimeow.icu/v1`). Selecting a preset pre-fills the endpoint and model, so only the API key — stored Windows-encrypted as before — needs to be entered; presets whose endpoint and model already exist hide automatically.
+
 ## 1.8.1 — 2026-08-30
 
 - Reframed the project as a local-first minimalist agent platform, moved post-turn context controls to the top of the project introduction, and added a fully bilingual README plus a complete English user guide.
